@@ -4,3 +4,4 @@ coverage
 work
 .env
 .DS_Store
+stdout
