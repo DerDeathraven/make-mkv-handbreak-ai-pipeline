@@ -102,6 +102,7 @@ export interface DiscMatchRequest {
   seasonNumber: number;
   discLabel: string;
   episodeMinSeconds: number;
+  lastCompletedEpisodeNumber?: number;
   rippedTitles: RippedTitle[];
   candidateEpisodes: SeasonEpisode[];
 }
@@ -202,4 +203,14 @@ export interface DiscMonitor {
   poll(): Promise<DiscPresence>;
   waitForStableInsertion(): Promise<DiscPresence>;
   waitForRemoval(): Promise<void>;
+}
+
+export interface SeriesProgressRecord {
+  key: string;
+  showTitle: string;
+  seasonNumber: number;
+  lastCompletedEpisodeNumber: number;
+  lastUpdatedAt: string;
+  lastJobId: string;
+  lastDiscLabel: string;
 }

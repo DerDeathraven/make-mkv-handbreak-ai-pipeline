@@ -19,6 +19,7 @@ npm install
 npm run install:deps
 npm run build
 node dist/src/cli/index.js validate-config --config ./config.yaml
+node dist/src/cli/index.js smoke-test --config ./config.yaml
 node dist/src/cli/index.js dry-run-match --config ./config.yaml --disc-label "DISC_1" --titles-json ./titles.json
 node dist/src/cli/index.js watch --config ./config.yaml
 ```

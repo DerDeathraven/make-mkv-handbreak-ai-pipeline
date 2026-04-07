@@ -1,6 +1,7 @@
 import path from "node:path";
 import { stat } from "node:fs/promises";
 import type {
+  CommandRunner,
   DiscPresence,
   DiscScan,
   DiscMonitor,
@@ -21,11 +22,13 @@ import { buildDestinationPath } from "../naming/jellyfin";
 import { TmdbClient } from "../metadata/tmdb";
 import { FfprobeService } from "../media/ffprobe";
 import { buildDiscMatchRequest, buildEpisodeLookup, validateAndNormalizeMappings } from "../matching/mapper";
+import { SeriesProgressStore } from "../state/series-progress";
 import { ensureDir, fileExists, moveFile, removeFileIfExists, writeTextFile } from "../utils/fs";
 
 interface PipelineDependencies {
   config: ResolvedConfig;
   logger: PipelineLogger;
+  runner: CommandRunner;
   monitor: DiscMonitor;
   makeMkv: MakeMkvService;
   ffprobe: FfprobeService;
@@ -33,6 +36,7 @@ interface PipelineDependencies {
   openai: OpenAiMatcher;
   handbrake: HandBrakeService;
   manifestStore: JobManifestStore;
+  seriesProgressStore: SeriesProgressStore;
 }
 
 function createJobId(discLabel: string): string {
@@ -147,6 +151,18 @@ export class PipelineService {
       manifest.scan = scan;
       await this.deps.manifestStore.save(manifest);
 
+      const seriesProgress = await this.deps.seriesProgressStore.get(
+        this.deps.config.series.showTitle,
+        this.deps.config.series.seasonNumber
+      );
+      if (seriesProgress) {
+        this.deps.logger.info("Loaded season progress from previous runs", {
+          lastCompletedEpisodeNumber: seriesProgress.lastCompletedEpisodeNumber,
+          lastJobId: seriesProgress.lastJobId,
+          lastDiscLabel: seriesProgress.lastDiscLabel
+        });
+      }
+
       let seasonEpisodes: SeasonEpisode[] = [];
       try {
         seasonEpisodes = await this.deps.tmdb.getSeasonEpisodes();
@@ -157,7 +173,7 @@ export class PipelineService {
       }
 
       await this.ripAndProbeTitles(manifest, scan, seasonEpisodes);
-      await this.matchTitles(manifest, seasonEpisodes);
+      await this.matchTitles(manifest, seasonEpisodes, seriesProgress?.lastCompletedEpisodeNumber);
       await this.processTitleJobs(manifest);
     } catch (error) {
       manifest.status = "failed";
@@ -180,6 +196,87 @@ export class PipelineService {
     );
     const aiResponse = await this.deps.openai.matchDisc(request);
     return validateAndNormalizeMappings(request, aiResponse);
+  }
+
+  async runSmokeTest(): Promise<{
+    handbrakeVersion: string;
+    ffprobeVersion: string;
+    tmdbEpisodeCount: number;
+    openAiMappingCount: number;
+    destinationTestFile: string;
+  }> {
+    await this.validateEnvironment();
+
+    const handbrakeVersion = await this.runCommandForSummary(
+      this.deps.config.handbrake.binaryPath,
+      ["--version"]
+    );
+    const ffprobeVersion = await this.runCommandForSummary(
+      this.deps.config.ffprobe.binaryPath,
+      ["-version"]
+    );
+
+    const seasonEpisodes = await this.deps.tmdb.getSeasonEpisodes();
+    if (!seasonEpisodes.length) {
+      throw new Error("TMDb smoke test returned no episodes for the configured season");
+    }
+
+    const syntheticTitles: RippedTitle[] = seasonEpisodes.slice(0, 2).map((episode, index) => ({
+      titleIndex: index + 1,
+      sourceOrder: index + 1,
+      filePath: path.join(this.deps.config.app.workRoot, `smoke-test-title-${index + 1}.mkv`),
+      fileName: `smoke-test-title-${index + 1}.mkv`,
+      sizeBytes: 0,
+      durationSeconds: Math.max(
+        this.deps.config.matching.episodeMinSeconds,
+        (episode.runtimeMinutes ?? 22) * 60
+      )
+    }));
+
+    const request = buildDiscMatchRequest(
+      this.deps.config.series.showTitle,
+      this.deps.config.series.seasonNumber,
+      this.deps.config.matching.episodeMinSeconds,
+      "SMOKE_TEST_DISC",
+      syntheticTitles,
+      seasonEpisodes
+    );
+    const openAiResponse = await this.deps.openai.matchDisc(request);
+    const validatedMappings = validateAndNormalizeMappings(request, openAiResponse);
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const localProbeFile = path.join(
+      this.deps.config.app.workRoot,
+      "smoke-tests",
+      timestamp,
+      "write-test.txt"
+    );
+    const destinationTestFile = path.join(
+      this.deps.config.paths.libraryRoot,
+      "_pipeline-smoketest",
+      timestamp,
+      "write-test.txt"
+    );
+
+    await writeTextFile(
+      localProbeFile,
+      [
+        "Pipeline smoke test",
+        `Timestamp: ${new Date().toISOString()}`,
+        `Show: ${this.deps.config.series.showTitle}`,
+        `Season: ${this.deps.config.series.seasonNumber}`
+      ].join("\n")
+    );
+    await moveFile(localProbeFile, destinationTestFile);
+    await verifyFileReadable(destinationTestFile);
+
+    return {
+      handbrakeVersion,
+      ffprobeVersion,
+      tmdbEpisodeCount: seasonEpisodes.length,
+      openAiMappingCount: validatedMappings.length,
+      destinationTestFile
+    };
   }
 
   async retryReviewJob(jobId: string): Promise<JobManifest> {
@@ -241,7 +338,8 @@ export class PipelineService {
 
   private async matchTitles(
     manifest: JobManifest,
-    preloadedSeasonEpisodes: SeasonEpisode[] = []
+    preloadedSeasonEpisodes: SeasonEpisode[] = [],
+    lastCompletedEpisodeNumber?: number
   ): Promise<void> {
     manifest.status = "matching";
     await this.deps.manifestStore.save(manifest);
@@ -251,13 +349,18 @@ export class PipelineService {
       if (!seasonEpisodes.length) {
         seasonEpisodes = await this.deps.tmdb.getSeasonEpisodes();
       }
+      const filteredEpisodes = this.filterEpisodesForSequentialDiscs(
+        seasonEpisodes,
+        lastCompletedEpisodeNumber
+      );
       const request = buildDiscMatchRequest(
         this.deps.config.series.showTitle,
         this.deps.config.series.seasonNumber,
         this.deps.config.matching.episodeMinSeconds,
         manifest.discLabel,
         manifest.rippedTitles,
-        seasonEpisodes
+        filteredEpisodes,
+        lastCompletedEpisodeNumber
       );
       const aiResponse = await this.deps.openai.matchDisc(request);
       manifest.mappings = validateAndNormalizeMappings(request, aiResponse);
@@ -386,6 +489,7 @@ export class PipelineService {
       ? "completed"
       : "failed";
     await this.deps.manifestStore.save(manifest);
+    await this.updateSeriesProgressFromManifest(manifest);
   }
 
   private async moveToReview(
@@ -400,6 +504,69 @@ export class PipelineService {
     await moveFile(sourcePath, targetPath);
     await writeTextFile(`${targetPath}.reason.txt`, `${reason}\n`);
     return targetPath;
+  }
+
+  private async runCommandForSummary(command: string, args: string[]): Promise<string> {
+    const result = await this.deps.runner.run(command, args);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Smoke test command failed: ${[command, ...args].join(" ")}\n${result.stderr || result.stdout}`
+      );
+    }
+    return (result.stdout || result.stderr).split(/\r?\n/).find((line) => line.trim()) ?? "";
+  }
+
+  private filterEpisodesForSequentialDiscs(
+    seasonEpisodes: SeasonEpisode[],
+    lastCompletedEpisodeNumber?: number
+  ): SeasonEpisode[] {
+    if (!lastCompletedEpisodeNumber) {
+      return seasonEpisodes;
+    }
+
+    const remainingEpisodes = seasonEpisodes.filter(
+      (episode) => episode.episodeNumber > lastCompletedEpisodeNumber
+    );
+
+    if (!remainingEpisodes.length) {
+      this.deps.logger.warn("Season progress indicates no remaining later episodes; using full season list", {
+        lastCompletedEpisodeNumber
+      });
+      return seasonEpisodes;
+    }
+
+    this.deps.logger.info("Constraining candidate episodes using prior season progress", {
+      lastCompletedEpisodeNumber,
+      firstCandidateEpisodeNumber: remainingEpisodes[0]?.episodeNumber,
+      candidateCount: remainingEpisodes.length
+    });
+
+    return remainingEpisodes;
+  }
+
+  private async updateSeriesProgressFromManifest(manifest: JobManifest): Promise<void> {
+    const completedEpisodeNumbers = manifest.titleJobs
+      .filter((titleJob) => titleJob.status === "moved")
+      .flatMap((titleJob) => titleJob.episodeNumbers)
+      .filter((episodeNumber) => Number.isFinite(episodeNumber));
+
+    if (!completedEpisodeNumbers.length) {
+      return;
+    }
+
+    const lastCompletedEpisodeNumber = Math.max(...completedEpisodeNumbers);
+    const updated = await this.deps.seriesProgressStore.update({
+      showTitle: manifest.showTitle,
+      seasonNumber: manifest.seasonNumber,
+      lastCompletedEpisodeNumber,
+      lastJobId: manifest.jobId,
+      lastDiscLabel: manifest.discLabel
+    });
+
+    this.deps.logger.info("Updated season progress from successful run", {
+      lastCompletedEpisodeNumber: updated.lastCompletedEpisodeNumber,
+      lastJobId: updated.lastJobId
+    });
   }
 
   private async restoreRetryableSources(manifest: JobManifest): Promise<void> {

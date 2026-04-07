@@ -124,13 +124,15 @@ export function buildDiscMatchRequest(
   episodeMinSeconds: number,
   discLabel: string,
   rippedTitles: RippedTitle[],
-  candidateEpisodes: SeasonEpisode[]
+  candidateEpisodes: SeasonEpisode[],
+  lastCompletedEpisodeNumber?: number
 ): DiscMatchRequest {
   return {
     showTitle,
     seasonNumber,
     discLabel,
     episodeMinSeconds,
+    lastCompletedEpisodeNumber,
     rippedTitles,
     candidateEpisodes
   };

@@ -1,8 +1,10 @@
 import path from "node:path";
-import { writeFile, mkdir, stat } from "node:fs/promises";
+import { chmod, writeFile, mkdir, stat } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
+import type { DiscMatchRequest, DiscMatchResponse, SeasonEpisode } from "../src/types";
 import { PipelineService } from "../src/app/pipeline";
 import { JobManifestStore } from "../src/jobs/manifest";
+import { SeriesProgressStore } from "../src/state/series-progress";
 import { createTempDir, createTestConfig, noopLogger, removeTempDir } from "./helpers";
 
 describe("PipelineService integration", () => {
@@ -12,11 +14,23 @@ describe("PipelineService integration", () => {
     await Promise.all(tempDirs.splice(0).map(removeTempDir));
   });
 
-  function createService(rootDir: string, options?: {
+  async function createService(rootDir: string, options?: {
     openAiError?: string;
     conflict?: boolean;
-  }): PipelineService {
+    seasonEpisodes?: SeasonEpisode[];
+    matchDiscImpl?: (request: DiscMatchRequest) => Promise<DiscMatchResponse>;
+  }): Promise<PipelineService> {
     const config = createTestConfig(rootDir);
+    const binaryPaths = [
+      config.makemkv.binaryPath,
+      config.handbrake.binaryPath,
+      config.ffprobe.binaryPath
+    ];
+    for (const binaryPath of binaryPaths) {
+      await mkdir(path.dirname(binaryPath), { recursive: true });
+      await writeFile(binaryPath, "#!/usr/bin/env bash\nexit 0\n");
+      await chmod(binaryPath, 0o755);
+    }
     const manifestStore = new JobManifestStore(config.app.workRoot);
 
     const makeMkv = {
@@ -54,14 +68,19 @@ describe("PipelineService integration", () => {
 
     const tmdb = {
       async getSeasonEpisodes() {
-        return [{ seasonNumber: 1, episodeNumber: 1, name: "Pilot", runtimeMinutes: 25 }];
+        return options?.seasonEpisodes ?? [
+          { seasonNumber: 1, episodeNumber: 1, name: "Pilot", runtimeMinutes: 25 }
+        ];
       }
     };
 
     const openai = {
-      async matchDisc() {
+      async matchDisc(request: DiscMatchRequest) {
         if (options?.openAiError) {
           throw new Error(options.openAiError);
+        }
+        if (options?.matchDiscImpl) {
+          return options.matchDiscImpl(request);
         }
         return {
           discLabel: "DISC_1",
@@ -91,6 +110,17 @@ describe("PipelineService integration", () => {
     return new PipelineService({
       config,
       logger: noopLogger,
+      runner: {
+        async run(command: string) {
+          if (command.endsWith("HandBrakeCLI")) {
+            return { stdout: "HandBrake 1.11.1\n", stderr: "", exitCode: 0 };
+          }
+          if (command.endsWith("ffprobe")) {
+            return { stdout: "ffprobe version 8.1\n", stderr: "", exitCode: 0 };
+          }
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+      },
       monitor: {
         async poll() {
           return { present: false, rawOutput: "" };
@@ -107,14 +137,15 @@ describe("PipelineService integration", () => {
       tmdb: tmdb as never,
       openai: openai as never,
       handbrake: handbrake as never,
-      manifestStore
+      manifestStore,
+      seriesProgressStore: new SeriesProgressStore(config.app.workRoot)
     });
   }
 
   it("moves encoded output to Jellyfin and deletes the source rip after success", async () => {
     const tempDir = await createTempDir("pipeline-success-");
     tempDirs.push(tempDir);
-    const service = createService(tempDir);
+    const service = await createService(tempDir);
 
     const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
     const finalPath = manifest.titleJobs[0].finalPath;
@@ -130,7 +161,7 @@ describe("PipelineService integration", () => {
   it("routes titles to review when OpenAI matching fails", async () => {
     const tempDir = await createTempDir("pipeline-openai-fail-");
     tempDirs.push(tempDir);
-    const service = createService(tempDir, { openAiError: "timeout" });
+    const service = await createService(tempDir, { openAiError: "timeout" });
 
     const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
 
@@ -143,13 +174,13 @@ describe("PipelineService integration", () => {
     const tempDir = await createTempDir("pipeline-retry-review-");
     tempDirs.push(tempDir);
 
-    const failingService = createService(tempDir, { openAiError: "timeout" });
+    const failingService = await createService(tempDir, { openAiError: "timeout" });
     const failedManifest = await failingService.processDetectedDisc({ present: true, rawOutput: "" });
 
     expect(failedManifest.titleJobs[0].status).toBe("review");
     expect(await stat(path.join(failedManifest.reviewDir, "title_t00.mkv"))).toBeDefined();
 
-    const retryService = createService(tempDir);
+    const retryService = await createService(tempDir);
     const retriedManifest = await retryService.retryReviewJob(failedManifest.jobId);
 
     expect(retriedManifest.titleJobs[0].status).toBe("moved");
@@ -170,11 +201,79 @@ describe("PipelineService integration", () => {
     await mkdir(path.dirname(existingDestination), { recursive: true });
     await writeFile(existingDestination, "existing");
 
-    const service = createService(tempDir, { conflict: true });
+    const service = await createService(tempDir, { conflict: true });
     const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
 
     expect(manifest.titleJobs[0].status).toBe("conflict");
     expect(await stat(path.join(manifest.reviewDir, "conflicts", "title_t00.mkv"))).toBeDefined();
     expect(await stat(manifest.titleJobs[0].sourcePath)).toBeDefined();
+  });
+
+  it("runs a smoke test that writes a probe file into the destination library", async () => {
+    const tempDir = await createTempDir("pipeline-smoke-test-");
+    tempDirs.push(tempDir);
+    const service = await createService(tempDir);
+
+    const result = await service.runSmokeTest();
+
+    expect(result.tmdbEpisodeCount).toBeGreaterThan(0);
+    expect(result.openAiMappingCount).toBeGreaterThan(0);
+    expect(await stat(result.destinationTestFile)).toBeDefined();
+  });
+
+  it("carries over season progress so the next fresh disc starts after the last completed episode", async () => {
+    const tempDir = await createTempDir("pipeline-sequential-progress-");
+    tempDirs.push(tempDir);
+    const seasonEpisodes: SeasonEpisode[] = [
+      { seasonNumber: 1, episodeNumber: 1, name: "Pilot", runtimeMinutes: 25 },
+      { seasonNumber: 1, episodeNumber: 2, name: "Second", runtimeMinutes: 25 },
+      { seasonNumber: 1, episodeNumber: 3, name: "Third", runtimeMinutes: 25 }
+    ];
+    const seenCandidateEpisodes: number[][] = [];
+
+    const firstService = await createService(tempDir, {
+      seasonEpisodes,
+      matchDiscImpl: async (request) => {
+        seenCandidateEpisodes.push(request.candidateEpisodes.map((episode) => episode.episodeNumber));
+        return {
+          discLabel: request.discLabel,
+          titles: [
+            {
+              titleIndex: 1,
+              classification: "episode",
+              seasonNumber: 1,
+              episodeNumbers: [1],
+              reason: "first disc"
+            }
+          ]
+        };
+      }
+    });
+    await firstService.processDetectedDisc({ present: true, rawOutput: "" });
+
+    const secondService = await createService(tempDir, {
+      seasonEpisodes,
+      matchDiscImpl: async (request) => {
+        seenCandidateEpisodes.push(request.candidateEpisodes.map((episode) => episode.episodeNumber));
+        return {
+          discLabel: request.discLabel,
+          titles: [
+            {
+              titleIndex: 1,
+              classification: "episode",
+              seasonNumber: 1,
+              episodeNumbers: [2],
+              reason: "second disc"
+            }
+          ]
+        };
+      }
+    });
+    await secondService.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(seenCandidateEpisodes).toEqual([
+      [1, 2, 3],
+      [2, 3]
+    ]);
   });
 });

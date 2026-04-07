@@ -11,6 +11,7 @@ import { JobManifestStore } from "../jobs/manifest";
 import { createLogger } from "../logging/logger";
 import { TmdbClient } from "../metadata/tmdb";
 import { FfprobeService } from "../media/ffprobe";
+import { SeriesProgressStore } from "../state/series-progress";
 import { NodeCommandRunner } from "../utils/command";
 
 function parseOption(args: string[], optionName: string): string | undefined {
@@ -43,13 +44,15 @@ async function buildService(configPath: string): Promise<{
   const service = new PipelineService({
     config,
     logger,
+    runner,
     monitor: new PollingDiscMonitor(runner, config, logger),
     makeMkv: new MakeMkvService(runner, config, logger),
     ffprobe: new FfprobeService(runner, config, logger),
     tmdb: new TmdbClient(config, logger),
     openai: new OpenAiMatcher(config, logger),
     handbrake: new HandBrakeService(runner, config, logger),
-    manifestStore: new JobManifestStore(config.app.workRoot)
+    manifestStore: new JobManifestStore(config.app.workRoot),
+    seriesProgressStore: new SeriesProgressStore(config.app.workRoot)
   });
   return { service, config };
 }
@@ -99,6 +102,12 @@ export async function runCli(argv: string[]): Promise<void> {
     process.stdout.write(
       `${JSON.stringify({ jobId: manifest.jobId, status: manifest.status }, null, 2)}\n`
     );
+    return;
+  }
+
+  if (command === "smoke-test") {
+    const result = await service.runSmokeTest();
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
 
