@@ -1,0 +1,383 @@
+import path from "node:path";
+import { stat } from "node:fs/promises";
+import type {
+  DiscPresence,
+  DiscScan,
+  DiscMonitor,
+  JobManifest,
+  PipelineLogger,
+  ResolvedConfig,
+  RippedTitle,
+  SeasonEpisode,
+  TitleJobRecord,
+  TitleMapping
+} from "../types";
+import { OpenAiMatcher } from "../ai/openai";
+import { MakeMkvService } from "../disc/makemkv";
+import { selectTitlesForRip } from "../disc/title-selection";
+import { HandBrakeService } from "../encode/handbrake";
+import { JobManifestStore } from "../jobs/manifest";
+import { buildDestinationPath } from "../naming/jellyfin";
+import { TmdbClient } from "../metadata/tmdb";
+import { FfprobeService } from "../media/ffprobe";
+import { buildDiscMatchRequest, buildEpisodeLookup, validateAndNormalizeMappings } from "../matching/mapper";
+import { ensureDir, fileExists, moveFile, removeFileIfExists, writeTextFile } from "../utils/fs";
+
+interface PipelineDependencies {
+  config: ResolvedConfig;
+  logger: PipelineLogger;
+  monitor: DiscMonitor;
+  makeMkv: MakeMkvService;
+  ffprobe: FfprobeService;
+  tmdb: TmdbClient;
+  openai: OpenAiMatcher;
+  handbrake: HandBrakeService;
+  manifestStore: JobManifestStore;
+}
+
+function createJobId(discLabel: string): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const safeLabel = discLabel
+    .replace(/[^\w.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return `${timestamp}-${safeLabel || "disc"}`;
+}
+
+function createManifest(
+  config: ResolvedConfig,
+  discLabel: string
+): JobManifest {
+  const jobId = createJobId(discLabel);
+  const workDir = path.join(config.app.workRoot, "jobs", jobId);
+  return {
+    version: 1,
+    jobId,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    status: "disc_detected",
+    discLabel,
+    showTitle: config.series.showTitle,
+    seasonNumber: config.series.seasonNumber,
+    workDir,
+    ripDir: path.join(workDir, "rip"),
+    encodedDir: path.join(workDir, "encoded"),
+    reviewDir: path.join(workDir, "review"),
+    rippedTitles: [],
+    mappings: [],
+    titleJobs: [],
+    errors: []
+  };
+}
+
+async function verifyFileReadable(targetPath: string): Promise<void> {
+  const fileStat = await stat(targetPath);
+  if (!fileStat.isFile() || fileStat.size <= 0) {
+    throw new Error(`Output file is missing or empty: ${targetPath}`);
+  }
+}
+
+export class PipelineService {
+  constructor(private readonly deps: PipelineDependencies) {}
+
+  async validateEnvironment(): Promise<void> {
+    const {
+      config,
+      logger
+    } = this.deps;
+    await ensureDir(config.app.workRoot);
+    await ensureDir(config.paths.libraryRoot);
+
+    const requiredPaths = [
+      config.makemkv.binaryPath,
+      config.handbrake.binaryPath,
+      config.ffprobe.binaryPath
+    ];
+
+    for (const binaryPath of requiredPaths) {
+      if (!(await fileExists(binaryPath))) {
+        throw new Error(`Required binary not found: ${binaryPath}`);
+      }
+    }
+
+    if (config.handbrake.presetImportFile && !(await fileExists(config.handbrake.presetImportFile))) {
+      throw new Error(`Preset import file not found: ${config.handbrake.presetImportFile}`);
+    }
+
+    logger.info("Environment validation succeeded");
+  }
+
+  async resumePendingJobs(): Promise<void> {
+    const manifests = await this.deps.manifestStore.listPending();
+    for (const manifest of manifests) {
+      this.deps.logger.info("Resuming pending manifest", {
+        jobId: manifest.jobId,
+        status: manifest.status
+      });
+      await this.processTitleJobs(manifest);
+    }
+  }
+
+  async runWatchLoop(): Promise<void> {
+    await this.validateEnvironment();
+    await this.resumePendingJobs();
+    for (;;) {
+      const presence = await this.deps.monitor.waitForStableInsertion();
+      try {
+        await this.processDetectedDisc(presence);
+      } catch (error) {
+        this.deps.logger.error("Disc processing failed", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+      await this.deps.monitor.waitForRemoval();
+    }
+  }
+
+  async processDetectedDisc(_presence: DiscPresence): Promise<JobManifest> {
+    const scan = await this.deps.makeMkv.scanDisc();
+    const manifest = createManifest(this.deps.config, scan.discLabel);
+    await ensureDir(manifest.workDir);
+    await ensureDir(manifest.ripDir);
+    await ensureDir(manifest.encodedDir);
+    await ensureDir(manifest.reviewDir);
+
+    try {
+      manifest.status = "scanning";
+      manifest.scan = scan;
+      await this.deps.manifestStore.save(manifest);
+
+      let seasonEpisodes: SeasonEpisode[] = [];
+      try {
+        seasonEpisodes = await this.deps.tmdb.getSeasonEpisodes();
+      } catch (error) {
+        this.deps.logger.warn("TMDb lookup unavailable before rip filtering", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+
+      await this.ripAndProbeTitles(manifest, scan, seasonEpisodes);
+      await this.matchTitles(manifest, seasonEpisodes);
+      await this.processTitleJobs(manifest);
+    } catch (error) {
+      manifest.status = "failed";
+      manifest.errors.push(error instanceof Error ? error.message : String(error));
+      await this.deps.manifestStore.save(manifest);
+      throw error;
+    }
+    return manifest;
+  }
+
+  async dryRunMatch(discLabel: string, rippedTitles: RippedTitle[]): Promise<TitleMapping[]> {
+    const episodes = await this.deps.tmdb.getSeasonEpisodes();
+    const request = buildDiscMatchRequest(
+      this.deps.config.series.showTitle,
+      this.deps.config.series.seasonNumber,
+      this.deps.config.matching.episodeMinSeconds,
+      discLabel,
+      rippedTitles,
+      episodes
+    );
+    const aiResponse = await this.deps.openai.matchDisc(request);
+    return validateAndNormalizeMappings(request, aiResponse);
+  }
+
+  private async ripAndProbeTitles(
+    manifest: JobManifest,
+    scan: DiscScan,
+    seasonEpisodes: SeasonEpisode[]
+  ): Promise<void> {
+    manifest.status = "ripping";
+    await this.deps.manifestStore.save(manifest);
+
+    const selection = selectTitlesForRip(
+      scan.titles,
+      seasonEpisodes,
+      this.deps.config.matching.episodeMinSeconds,
+      this.deps.config.matching.stitchedTitleMultiplier
+    );
+
+    if (selection.skippedTitles.length) {
+      this.deps.logger.info("Skipping stitched compilation titles before rip", {
+        baselineRuntimeSeconds: selection.baselineRuntimeSeconds,
+        skipThresholdSeconds: selection.skipThresholdSeconds,
+        skippedTitles: selection.skippedTitles
+      });
+    }
+
+    await this.deps.makeMkv.ripTitles(
+      manifest.ripDir,
+      selection.selectedTitles.map((title) => title.titleId)
+    );
+
+    manifest.status = "probing";
+    await this.deps.manifestStore.save(manifest);
+    const rippedFiles = await this.deps.makeMkv.buildRippedTitleList(manifest.ripDir, scan);
+
+    const titles: RippedTitle[] = [];
+    for (const rippedFile of rippedFiles) {
+      const probe = await this.deps.ffprobe.probe(rippedFile.filePath);
+      const titleStat = await stat(rippedFile.filePath);
+      titles.push({
+        ...rippedFile,
+        sizeBytes: titleStat.size,
+        durationSeconds: probe.durationSeconds
+      });
+    }
+
+    manifest.rippedTitles = titles;
+    await this.deps.manifestStore.save(manifest);
+  }
+
+  private async matchTitles(
+    manifest: JobManifest,
+    preloadedSeasonEpisodes: SeasonEpisode[] = []
+  ): Promise<void> {
+    manifest.status = "matching";
+    await this.deps.manifestStore.save(manifest);
+
+    let seasonEpisodes: SeasonEpisode[] = [...preloadedSeasonEpisodes];
+    try {
+      if (!seasonEpisodes.length) {
+        seasonEpisodes = await this.deps.tmdb.getSeasonEpisodes();
+      }
+      const request = buildDiscMatchRequest(
+        this.deps.config.series.showTitle,
+        this.deps.config.series.seasonNumber,
+        this.deps.config.matching.episodeMinSeconds,
+        manifest.discLabel,
+        manifest.rippedTitles,
+        seasonEpisodes
+      );
+      const aiResponse = await this.deps.openai.matchDisc(request);
+      manifest.mappings = validateAndNormalizeMappings(request, aiResponse);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      manifest.errors.push(`Matching fallback triggered: ${reason}`);
+      manifest.mappings = manifest.rippedTitles.map((title) => ({
+        titleIndex: title.titleIndex,
+        classification: title.durationSeconds < this.deps.config.matching.episodeMinSeconds ? "extra" : "unmapped",
+        episodeNumbers: [],
+        reason
+      }));
+    }
+
+    const episodeMap = buildEpisodeLookup(seasonEpisodes);
+    manifest.titleJobs = manifest.rippedTitles.map((title) => {
+      const mapping =
+        manifest.mappings.find((candidate) => candidate.titleIndex === title.titleIndex) ??
+        {
+          titleIndex: title.titleIndex,
+          classification: "unmapped",
+          episodeNumbers: [],
+          reason: "No valid mapping returned"
+        };
+
+      return {
+        titleIndex: title.titleIndex,
+        sourcePath: title.filePath,
+        finalPath:
+          mapping.classification === "unmapped"
+            ? undefined
+            : buildDestinationPath(this.deps.config, manifest.discLabel, title, mapping, episodeMap),
+        classification: mapping.classification,
+        episodeNumbers: mapping.episodeNumbers,
+        status: "pending",
+        reason: mapping.reason
+      } satisfies TitleJobRecord;
+    });
+
+    await this.deps.manifestStore.save(manifest);
+  }
+
+  async processTitleJobs(manifest: JobManifest): Promise<void> {
+    if (!manifest.titleJobs.length) {
+      manifest.status = "failed";
+      manifest.errors.push("No title jobs available for processing");
+      await this.deps.manifestStore.save(manifest);
+      return;
+    }
+
+    manifest.status = "encoding";
+    await this.deps.manifestStore.save(manifest);
+
+    for (const titleJob of manifest.titleJobs) {
+      const sourceTitle = manifest.rippedTitles.find((title) => title.titleIndex === titleJob.titleIndex);
+      if (!sourceTitle) {
+        titleJob.status = "failed";
+        titleJob.error = "Ripped source title missing";
+        continue;
+      }
+
+      if (titleJob.status === "moved" || titleJob.status === "review" || titleJob.status === "conflict") {
+        continue;
+      }
+
+      try {
+        if (!titleJob.finalPath || titleJob.classification === "unmapped") {
+          await this.moveToReview(manifest, titleJob.sourcePath, titleJob.reason);
+          titleJob.status = "review";
+          await this.deps.manifestStore.save(manifest);
+          continue;
+        }
+
+        const encodedPath =
+          titleJob.encodedPath ??
+          this.deps.handbrake.buildEncodedPath(manifest.encodedDir, titleJob.sourcePath);
+        titleJob.encodedPath = encodedPath;
+        titleJob.status = "encoding";
+        await this.deps.manifestStore.save(manifest);
+
+        await this.deps.handbrake.encode(titleJob.sourcePath, encodedPath);
+        await verifyFileReadable(encodedPath);
+        await this.deps.ffprobe.probe(encodedPath);
+
+        if (await fileExists(titleJob.finalPath)) {
+          const conflictPath = path.join(
+            manifest.reviewDir,
+            "conflicts",
+            path.basename(encodedPath)
+          );
+          await moveFile(encodedPath, conflictPath);
+          titleJob.status = "conflict";
+          titleJob.error = `Destination already exists: ${titleJob.finalPath}`;
+          await this.deps.manifestStore.save(manifest);
+          continue;
+        }
+
+        manifest.status = "moving";
+        await this.deps.manifestStore.save(manifest);
+        await moveFile(encodedPath, titleJob.finalPath);
+        await verifyFileReadable(titleJob.finalPath);
+        await removeFileIfExists(titleJob.sourcePath);
+        titleJob.status = "moved";
+        await this.deps.manifestStore.save(manifest);
+        manifest.status = "encoding";
+      } catch (error) {
+        titleJob.status = "failed";
+        titleJob.error = error instanceof Error ? error.message : String(error);
+        manifest.errors.push(`[Title ${titleJob.titleIndex}] ${titleJob.error}`);
+        await this.moveToReview(manifest, titleJob.sourcePath, titleJob.error);
+        await this.deps.manifestStore.save(manifest);
+      }
+    }
+
+    manifest.status = manifest.titleJobs.every((titleJob) => titleJob.status === "moved" || titleJob.status === "review" || titleJob.status === "conflict")
+      ? "completed"
+      : "failed";
+    await this.deps.manifestStore.save(manifest);
+  }
+
+  private async moveToReview(
+    manifest: JobManifest,
+    sourcePath: string,
+    reason: string
+  ): Promise<void> {
+    if (!(await fileExists(sourcePath))) {
+      return;
+    }
+    const targetPath = path.join(manifest.reviewDir, path.basename(sourcePath));
+    await moveFile(sourcePath, targetPath);
+    await writeTextFile(`${targetPath}.reason.txt`, `${reason}\n`);
+  }
+}

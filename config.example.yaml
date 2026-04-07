@@ -1,0 +1,43 @@
+app:
+  poll_interval_seconds: 5
+  work_root: "./work"
+  log_level: "info"
+
+disc:
+  drive_selector: "disc:0"
+  stable_insert_seconds: 10
+  rip_min_seconds: 120
+
+series:
+  show_title: "Stargate SG-1"
+  season_number: 1
+  language: "en-US"
+
+matching:
+  episode_min_seconds: 700
+  extras_folder_name: "Extras"
+  accept_multi_episode: true
+  stitched_title_multiplier: 2.5
+
+openai:
+  api_key: "env:OPENAI_API_KEY"
+  model: "gpt-5-mini"
+  base_url: null
+
+tmdb:
+  api_key: "env:TMDB_API_KEY"
+  base_url: "https://api.themoviedb.org/3"
+
+makemkv:
+  binary_path: "/opt/homebrew/bin/makemkvcon"
+
+handbrake:
+  binary_path: "/opt/homebrew/bin/HandBrakeCLI"
+  preset_name: "Fast 1080p30"
+  preset_import_file: null
+
+ffprobe:
+  binary_path: "/opt/homebrew/bin/ffprobe"
+
+paths:
+  library_root: "/Volumes/Media/TV"
