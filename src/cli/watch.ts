@@ -92,6 +92,16 @@ export async function runCli(argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === "retry-review") {
+    const jobId = parseRequiredOption(args, "--job-id");
+    await service.validateEnvironment();
+    const manifest = await service.retryReviewJob(jobId);
+    process.stdout.write(
+      `${JSON.stringify({ jobId: manifest.jobId, status: manifest.status }, null, 2)}\n`
+    );
+    return;
+  }
+
   if (command === "watch") {
     await service.runWatchLoop();
     return;

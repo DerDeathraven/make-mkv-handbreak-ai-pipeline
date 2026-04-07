@@ -182,6 +182,16 @@ export class PipelineService {
     return validateAndNormalizeMappings(request, aiResponse);
   }
 
+  async retryReviewJob(jobId: string): Promise<JobManifest> {
+    const manifest = await this.deps.manifestStore.loadByJobId(jobId);
+    await ensureDir(manifest.ripDir);
+    await ensureDir(manifest.reviewDir);
+    await this.restoreRetryableSources(manifest);
+    await this.rematchRetryableTitles(manifest);
+    await this.processTitleJobs(manifest);
+    return manifest;
+  }
+
   private async ripAndProbeTitles(
     manifest: JobManifest,
     scan: DiscScan,
@@ -315,7 +325,12 @@ export class PipelineService {
 
       try {
         if (!titleJob.finalPath || titleJob.classification === "unmapped") {
-          await this.moveToReview(manifest, titleJob.sourcePath, titleJob.reason);
+          const reviewPath = await this.moveToReview(manifest, titleJob.sourcePath, titleJob.reason);
+          if (reviewPath) {
+            titleJob.sourcePath = reviewPath;
+            sourceTitle.filePath = reviewPath;
+            sourceTitle.fileName = path.basename(reviewPath);
+          }
           titleJob.status = "review";
           await this.deps.manifestStore.save(manifest);
           continue;
@@ -357,7 +372,12 @@ export class PipelineService {
         titleJob.status = "failed";
         titleJob.error = error instanceof Error ? error.message : String(error);
         manifest.errors.push(`[Title ${titleJob.titleIndex}] ${titleJob.error}`);
-        await this.moveToReview(manifest, titleJob.sourcePath, titleJob.error);
+        const reviewPath = await this.moveToReview(manifest, titleJob.sourcePath, titleJob.error);
+        if (reviewPath) {
+          titleJob.sourcePath = reviewPath;
+          sourceTitle.filePath = reviewPath;
+          sourceTitle.fileName = path.basename(reviewPath);
+        }
         await this.deps.manifestStore.save(manifest);
       }
     }
@@ -372,12 +392,144 @@ export class PipelineService {
     manifest: JobManifest,
     sourcePath: string,
     reason: string
-  ): Promise<void> {
+  ): Promise<string | null> {
     if (!(await fileExists(sourcePath))) {
-      return;
+      return null;
     }
     const targetPath = path.join(manifest.reviewDir, path.basename(sourcePath));
     await moveFile(sourcePath, targetPath);
     await writeTextFile(`${targetPath}.reason.txt`, `${reason}\n`);
+    return targetPath;
+  }
+
+  private async restoreRetryableSources(manifest: JobManifest): Promise<void> {
+    const retryableStatuses = new Set(["review", "failed", "conflict"]);
+
+    for (const titleJob of manifest.titleJobs) {
+      if (!retryableStatuses.has(titleJob.status)) {
+        continue;
+      }
+
+      const sourceTitle = manifest.rippedTitles.find((title) => title.titleIndex === titleJob.titleIndex);
+      if (!sourceTitle) {
+        continue;
+      }
+
+      const preferredPath = path.join(manifest.ripDir, path.basename(sourceTitle.filePath));
+      const candidates = [
+        titleJob.sourcePath,
+        sourceTitle.filePath,
+        path.join(manifest.reviewDir, path.basename(titleJob.sourcePath)),
+        path.join(manifest.reviewDir, path.basename(sourceTitle.filePath))
+      ];
+
+      let existingPath: string | undefined;
+      for (const candidate of candidates) {
+        if (!candidate) {
+          continue;
+        }
+        if (await fileExists(candidate)) {
+          existingPath = candidate;
+          break;
+        }
+      }
+
+      if (!existingPath) {
+        throw new Error(`Could not find source file for retry on title ${titleJob.titleIndex}`);
+      }
+
+      if (existingPath !== preferredPath) {
+        await moveFile(existingPath, preferredPath);
+      }
+
+      titleJob.sourcePath = preferredPath;
+      titleJob.encodedPath = undefined;
+      titleJob.error = undefined;
+      sourceTitle.filePath = preferredPath;
+      sourceTitle.fileName = path.basename(preferredPath);
+    }
+
+    await this.deps.manifestStore.save(manifest);
+  }
+
+  private async rematchRetryableTitles(manifest: JobManifest): Promise<void> {
+    const retryableStatuses = new Set(["review", "failed", "conflict"]);
+    const retryableTitles = manifest.rippedTitles.filter((title) => {
+      const titleJob = manifest.titleJobs.find((job) => job.titleIndex === title.titleIndex);
+      return !titleJob || retryableStatuses.has(titleJob.status);
+    });
+
+    if (!retryableTitles.length) {
+      return;
+    }
+
+    manifest.status = "matching";
+    await this.deps.manifestStore.save(manifest);
+
+    let seasonEpisodes: SeasonEpisode[] = [];
+    let retryMappings: TitleMapping[];
+
+    try {
+      seasonEpisodes = await this.deps.tmdb.getSeasonEpisodes();
+      const request = buildDiscMatchRequest(
+        this.deps.config.series.showTitle,
+        this.deps.config.series.seasonNumber,
+        this.deps.config.matching.episodeMinSeconds,
+        manifest.discLabel,
+        retryableTitles,
+        seasonEpisodes
+      );
+      const aiResponse = await this.deps.openai.matchDisc(request);
+      retryMappings = validateAndNormalizeMappings(request, aiResponse);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      manifest.errors.push(`Retry matching fallback triggered: ${reason}`);
+      retryMappings = retryableTitles.map((title) => ({
+        titleIndex: title.titleIndex,
+        classification: title.durationSeconds < this.deps.config.matching.episodeMinSeconds ? "extra" : "unmapped",
+        episodeNumbers: [],
+        reason
+      }));
+    }
+
+    const retryMappingByTitle = new Map(retryMappings.map((mapping) => [mapping.titleIndex, mapping]));
+    const preservedMappings = manifest.mappings.filter(
+      (mapping) => !retryMappingByTitle.has(mapping.titleIndex)
+    );
+    manifest.mappings = [...preservedMappings, ...retryMappings];
+
+    const episodeMap = buildEpisodeLookup(seasonEpisodes);
+    const existingJobsByTitle = new Map(manifest.titleJobs.map((job) => [job.titleIndex, job]));
+
+    manifest.titleJobs = manifest.rippedTitles.map((title) => {
+      const existingJob = existingJobsByTitle.get(title.titleIndex);
+      if (existingJob && !retryableStatuses.has(existingJob.status)) {
+        return existingJob;
+      }
+
+      const mapping =
+        retryMappingByTitle.get(title.titleIndex) ??
+        ({
+          titleIndex: title.titleIndex,
+          classification: "unmapped",
+          episodeNumbers: [],
+          reason: "No valid mapping returned"
+        } satisfies TitleMapping);
+
+      return {
+        titleIndex: title.titleIndex,
+        sourcePath: title.filePath,
+        finalPath:
+          mapping.classification === "unmapped"
+            ? undefined
+            : buildDestinationPath(this.deps.config, manifest.discLabel, title, mapping, episodeMap),
+        classification: mapping.classification,
+        episodeNumbers: mapping.episodeNumbers,
+        status: "pending",
+        reason: mapping.reason
+      } satisfies TitleJobRecord;
+    });
+
+    await this.deps.manifestStore.save(manifest);
   }
 }

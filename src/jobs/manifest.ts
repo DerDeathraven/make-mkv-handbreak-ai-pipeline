@@ -25,6 +25,14 @@ export class JobManifestStore {
     return JSON.parse(content) as JobManifest;
   }
 
+  getManifestPath(jobId: string): string {
+    return path.join(this.jobsRoot, jobId, "manifest.json");
+  }
+
+  async loadByJobId(jobId: string): Promise<JobManifest> {
+    return this.load(this.getManifestPath(jobId));
+  }
+
   async listPending(): Promise<JobManifest[]> {
     await ensureDir(this.jobsRoot);
     const entries = await readdir(this.jobsRoot, { withFileTypes: true });

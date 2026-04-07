@@ -9,12 +9,12 @@ disc:
   rip_min_seconds: 120
 
 series:
-  show_title: "Stargate SG-1"
+  show_title: "The Librarians"
   season_number: 1
   language: "en-US"
 
 matching:
-  episode_min_seconds: 700
+  episode_min_seconds: 900
   extras_folder_name: "Extras"
   accept_multi_episode: true
   stitched_title_multiplier: 2.5

@@ -1,4 +1,4 @@
-import { mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export async function ensureDir(targetPath: string): Promise<void> {
@@ -36,7 +36,16 @@ export async function fileExists(targetPath: string): Promise<boolean> {
 
 export async function moveFile(sourcePath: string, destinationPath: string): Promise<void> {
   await ensureParentDir(destinationPath);
-  await rename(sourcePath, destinationPath);
+  try {
+    await rename(sourcePath, destinationPath);
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    if (failure.code !== "EXDEV") {
+      throw failure;
+    }
+    await copyFile(sourcePath, destinationPath);
+    await unlink(sourcePath);
+  }
 }
 
 export async function removeFileIfExists(targetPath: string): Promise<void> {

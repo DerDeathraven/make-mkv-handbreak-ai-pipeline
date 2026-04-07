@@ -139,6 +139,24 @@ describe("PipelineService integration", () => {
     expect(manifest.status).toBe("completed");
   });
 
+  it("can retry a reviewed job after the matching problem is fixed", async () => {
+    const tempDir = await createTempDir("pipeline-retry-review-");
+    tempDirs.push(tempDir);
+
+    const failingService = createService(tempDir, { openAiError: "timeout" });
+    const failedManifest = await failingService.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(failedManifest.titleJobs[0].status).toBe("review");
+    expect(await stat(path.join(failedManifest.reviewDir, "title_t00.mkv"))).toBeDefined();
+
+    const retryService = createService(tempDir);
+    const retriedManifest = await retryService.retryReviewJob(failedManifest.jobId);
+
+    expect(retriedManifest.titleJobs[0].status).toBe("moved");
+    expect(retriedManifest.status).toBe("completed");
+    expect(await stat(retriedManifest.titleJobs[0].finalPath!)).toBeDefined();
+  });
+
   it("does not overwrite existing destination files and preserves the source rip on conflict", async () => {
     const tempDir = await createTempDir("pipeline-conflict-");
     tempDirs.push(tempDir);

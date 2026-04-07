@@ -9,7 +9,7 @@ import type {
 const titleMappingSchema = z.object({
   title_index: z.number().int().positive(),
   classification: z.enum(["episode", "multi_episode", "extra", "unmapped"]),
-  season_number: z.number().int().positive().optional(),
+  season_number: z.number().int().positive().nullable(),
   episode_numbers: z.array(z.number().int().positive()).default([]),
   reason: z.string().min(1)
 });
@@ -94,7 +94,6 @@ export class OpenAiMatcher {
       },
       body: JSON.stringify({
         model: this.config.openai.model,
-        temperature: 0.1,
         messages: [
           {
             role: "system",
@@ -125,6 +124,7 @@ export class OpenAiMatcher {
                     required: [
                       "title_index",
                       "classification",
+                      "season_number",
                       "episode_numbers",
                       "reason"
                     ],
@@ -134,7 +134,9 @@ export class OpenAiMatcher {
                         type: "string",
                         enum: ["episode", "multi_episode", "extra", "unmapped"]
                       },
-                      season_number: { type: "integer" },
+                      season_number: {
+                        type: ["integer", "null"]
+                      },
                       episode_numbers: {
                         type: "array",
                         items: { type: "integer" }
@@ -164,7 +166,7 @@ export class OpenAiMatcher {
       titles: parsed.titles.map((title) => ({
         titleIndex: title.title_index,
         classification: title.classification,
-        seasonNumber: title.season_number,
+        seasonNumber: title.season_number ?? undefined,
         episodeNumbers: title.episode_numbers,
         reason: title.reason
       }))
