@@ -71,6 +71,47 @@ Homebrew-installed binaries on this machine are:
 - `HandBrakeCLI`: `/opt/homebrew/bin/HandBrakeCLI`
 - `ffprobe`: `/opt/homebrew/bin/ffprobe`
 
+## External Services
+
+### OpenAI
+
+The OpenAI connection is used for episode guessing.
+
+After the disc is ripped, the app sends OpenAI a structured summary of the ripped titles, including:
+
+- the disc label
+- each file's runtime
+- each file's order on the disc
+- the configured show and season
+- the candidate episode list for that season
+
+OpenAI then returns a best-guess mapping that says whether each ripped file is:
+
+- a normal episode
+- a multi-episode file
+- an extra
+- unmapped
+
+That response is used to build the final Jellyfin-style filenames and folder paths. This is only a guess layer, not a trusted metadata source.
+
+### TMDb
+
+The TMDb connection is used as the season metadata source.
+
+The app looks up the configured show and season on TMDb and pulls episode data such as:
+
+- episode number
+- episode title
+- runtime when available
+- season ordering
+
+That metadata is used for two things:
+
+- giving OpenAI better context so it can guess the episode mapping
+- helping the rip stage skip obviously giant stitched-together compilation titles before ripping them
+
+TMDb does not do the final guessing itself. It provides the candidate season data that the rest of the pipeline works from.
+
 ## Notes
 
 - The watcher is macOS-specific and uses `drutil` polling.
