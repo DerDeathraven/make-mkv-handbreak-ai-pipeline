@@ -390,7 +390,7 @@ export class PipelineService {
         titleIndex: title.titleIndex,
         sourcePath: title.filePath,
         finalPath:
-          mapping.classification === "unmapped"
+          mapping.classification === "unmapped" || mapping.classification === "skip"
             ? undefined
             : buildDestinationPath(this.deps.config, manifest.discLabel, title, mapping, episodeMap),
         classification: mapping.classification,
@@ -422,11 +422,23 @@ export class PipelineService {
         continue;
       }
 
-      if (titleJob.status === "moved" || titleJob.status === "review" || titleJob.status === "conflict") {
+      if (
+        titleJob.status === "moved" ||
+        titleJob.status === "skipped" ||
+        titleJob.status === "review" ||
+        titleJob.status === "conflict"
+      ) {
         continue;
       }
 
       try {
+        if (titleJob.classification === "skip") {
+          await removeFileIfExists(titleJob.sourcePath);
+          titleJob.status = "skipped";
+          await this.deps.manifestStore.save(manifest);
+          continue;
+        }
+
         if (!titleJob.finalPath || titleJob.classification === "unmapped") {
           const reviewPath = await this.moveToReview(manifest, titleJob.sourcePath, titleJob.reason);
           if (reviewPath) {
@@ -485,7 +497,13 @@ export class PipelineService {
       }
     }
 
-    manifest.status = manifest.titleJobs.every((titleJob) => titleJob.status === "moved" || titleJob.status === "review" || titleJob.status === "conflict")
+    manifest.status = manifest.titleJobs.every(
+      (titleJob) =>
+        titleJob.status === "moved" ||
+        titleJob.status === "skipped" ||
+        titleJob.status === "review" ||
+        titleJob.status === "conflict"
+    )
       ? "completed"
       : "failed";
     await this.deps.manifestStore.save(manifest);
@@ -687,7 +705,7 @@ export class PipelineService {
         titleIndex: title.titleIndex,
         sourcePath: title.filePath,
         finalPath:
-          mapping.classification === "unmapped"
+          mapping.classification === "unmapped" || mapping.classification === "skip"
             ? undefined
             : buildDestinationPath(this.deps.config, manifest.discLabel, title, mapping, episodeMap),
         classification: mapping.classification,

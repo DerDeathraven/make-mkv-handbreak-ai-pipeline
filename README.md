@@ -10,6 +10,10 @@ The episode matching is especially untrustworthy. It can guess wrong, mislabel e
 
 macOS-first CLI daemon that watches for optical disc insertion, rips titles with MakeMKV, maps them to episodes with OpenAI + TMDb, transcodes them with HandBrakeCLI, and moves the final files into a Jellyfin-compatible library layout.
 
+## Human Words
+
+These are the only words written by a human. short introduction: this project is just a quick way for me to build up my jellyfin server. its main job is to rip the DVD - Rename them via ChatGPT - Some Filtering for Stiched Episodes and stuff - Handbreak them - upload them. why was TS used an not something more fitting? I really dont know the AI decided that this was the way. but TBH this is fine since I can still read the code
+
 ## Commands
 
 ```bash

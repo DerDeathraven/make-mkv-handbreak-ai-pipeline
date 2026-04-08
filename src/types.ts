@@ -110,6 +110,7 @@ export interface DiscMatchRequest {
 export type TitleClassification =
   | "episode"
   | "multi_episode"
+  | "skip"
   | "extra"
   | "unmapped";
 
@@ -131,6 +132,7 @@ export type TitleJobStatus =
   | "encoding"
   | "encoded"
   | "moved"
+  | "skipped"
   | "review"
   | "conflict"
   | "failed";

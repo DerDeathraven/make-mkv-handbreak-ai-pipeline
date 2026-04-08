@@ -19,14 +19,26 @@ const discMatchResponseSchema = z.object({
   titles: z.array(titleMappingSchema)
 });
 
-function buildPrompt(request: DiscMatchRequest): string {
-  const titles = request.rippedTitles.map((title) => ({
+function buildTitleContext(request: DiscMatchRequest): Array<Record<string, unknown>> {
+  return request.rippedTitles.map((title, index) => ({
     title_index: title.titleIndex,
     source_order: title.sourceOrder,
     file_name: title.fileName,
-    duration_seconds: Math.round(title.durationSeconds)
+    duration_seconds: Math.round(title.durationSeconds),
+    previous_title_duration_seconds:
+      index > 0 ? Math.round(request.rippedTitles[index - 1].durationSeconds) : null,
+    next_title_duration_seconds:
+      index < request.rippedTitles.length - 1
+        ? Math.round(request.rippedTitles[index + 1].durationSeconds)
+        : null,
+    following_title_durations_seconds: request.rippedTitles
+      .slice(index + 1)
+      .map((candidate) => Math.round(candidate.durationSeconds))
   }));
+}
 
+export function buildPrompt(request: DiscMatchRequest): string {
+  const titles = buildTitleContext(request);
   const episodes = request.candidateEpisodes.map((episode) => ({
     season_number: episode.seasonNumber,
     episode_number: episode.episodeNumber,
@@ -47,6 +59,9 @@ function buildPrompt(request: DiscMatchRequest): string {
     "- Use `extra` for non-episode or bonus material.",
     "- Use `unmapped` if there is not enough evidence.",
     "- Use `multi_episode` only for consecutive episode numbers in one file.",
+    "- Watch for stitched-together files: one giant title may contain multiple consecutive episodes combined into a single file.",
+    "- If one title is much longer than the following normal-length episode files, strongly consider that giant title a `multi_episode` candidate rather than a single episode.",
+    "- Compare each title against the lengths of the titles that follow it on the same disc before deciding it is only one episode.",
     "- Assume discs are inserted in order when prior-run progress is provided.",
     "- Prefer episodes after the last completed episode from previous successful runs.",
     "",

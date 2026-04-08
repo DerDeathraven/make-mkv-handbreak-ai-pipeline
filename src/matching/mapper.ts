@@ -6,6 +6,37 @@ import type {
   TitleMapping
 } from "../types";
 
+function shouldFilterAsStitchedCompilation(
+  request: DiscMatchRequest,
+  titleIndex: number
+): boolean {
+  const currentTitle = request.rippedTitles.find((title) => title.titleIndex === titleIndex);
+  if (!currentTitle || currentTitle.durationSeconds < request.episodeMinSeconds) {
+    return false;
+  }
+
+  const otherFullLengthTitles = request.rippedTitles.filter(
+    (title) =>
+      title.titleIndex !== titleIndex &&
+      title.durationSeconds >= request.episodeMinSeconds
+  );
+
+  if (otherFullLengthTitles.length < 2) {
+    return false;
+  }
+
+  const otherTotalDuration = otherFullLengthTitles.reduce(
+    (total, title) => total + title.durationSeconds,
+    0
+  );
+  if (otherTotalDuration <= 0) {
+    return false;
+  }
+
+  const ratio = currentTitle.durationSeconds / otherTotalDuration;
+  return ratio >= 0.85 && ratio <= 1.15;
+}
+
 export function validateAndNormalizeMappings(
   request: DiscMatchRequest,
   response: DiscMatchResponse
@@ -68,6 +99,17 @@ export function validateAndNormalizeMappings(
         });
         continue;
       }
+
+      if (shouldFilterAsStitchedCompilation(request, mapping.titleIndex)) {
+        byTitleIndex.set(mapping.titleIndex, {
+          titleIndex: mapping.titleIndex,
+          classification: "skip",
+          episodeNumbers: sorted,
+          reason: `Filtered stitched multi-episode title: ${mapping.reason}`
+        });
+        continue;
+      }
+
       byTitleIndex.set(mapping.titleIndex, {
         ...mapping,
         episodeNumbers: sorted

@@ -19,6 +19,15 @@ describe("PipelineService integration", () => {
     conflict?: boolean;
     seasonEpisodes?: SeasonEpisode[];
     matchDiscImpl?: (request: DiscMatchRequest) => Promise<DiscMatchResponse>;
+    rippedTitles?: Array<{
+      titleIndex: number;
+      sourceOrder: number;
+      fileName: string;
+      durationSeconds: number;
+      reportedDurationSeconds?: number;
+      sizeBytes?: number;
+      makeMkvTitleId?: number;
+    }>;
   }): Promise<PipelineService> {
     const config = createTestConfig(rootDir);
     const binaryPaths = [
@@ -32,37 +41,54 @@ describe("PipelineService integration", () => {
       await chmod(binaryPath, 0o755);
     }
     const manifestStore = new JobManifestStore(config.app.workRoot);
+    const rippedTitles = options?.rippedTitles ?? [
+      {
+        titleIndex: 1,
+        sourceOrder: 1,
+        fileName: "title_t00.mkv",
+        durationSeconds: 1500,
+        reportedDurationSeconds: 1500,
+        sizeBytes: 6,
+        makeMkvTitleId: 0
+      }
+    ];
 
     const makeMkv = {
       async scanDisc() {
         return {
           discLabel: "DISC_1",
           rawOutput: "",
-          titles: [{ titleId: 0, sourceOrder: 1, rawAttributes: {} }]
+          titles: rippedTitles.map((title, index) => ({
+            titleId: title.makeMkvTitleId ?? index,
+            sourceOrder: title.sourceOrder,
+            reportedDurationSeconds: title.reportedDurationSeconds,
+            rawAttributes: {}
+          }))
         };
       },
       async ripTitles(outputDir: string) {
         await mkdir(outputDir, { recursive: true });
-        await writeFile(path.join(outputDir, "title_t00.mkv"), "source");
+        for (const title of rippedTitles) {
+          await writeFile(path.join(outputDir, title.fileName), "source");
+        }
       },
       async buildRippedTitleList(ripDir: string) {
-        return [
-          {
-            titleIndex: 1,
-            sourceOrder: 1,
-            filePath: path.join(ripDir, "title_t00.mkv"),
-            fileName: "title_t00.mkv",
-            sizeBytes: 6,
-            makeMkvTitleId: 0,
-            reportedDurationSeconds: 1500
-          }
-        ];
+        return rippedTitles.map((title, index) => ({
+          titleIndex: title.titleIndex,
+          sourceOrder: title.sourceOrder,
+          filePath: path.join(ripDir, title.fileName),
+          fileName: title.fileName,
+          sizeBytes: title.sizeBytes ?? 6,
+          makeMkvTitleId: title.makeMkvTitleId ?? index,
+          reportedDurationSeconds: title.reportedDurationSeconds
+        }));
       }
     };
 
     const ffprobe = {
-      async probe() {
-        return { durationSeconds: 1500 };
+      async probe(filePath: string) {
+        const matchedTitle = rippedTitles.find((title) => filePath.endsWith(title.fileName));
+        return { durationSeconds: matchedTitle?.durationSeconds ?? 1500 };
       }
     };
 
@@ -97,8 +123,8 @@ describe("PipelineService integration", () => {
     };
 
     const handbrake = {
-      buildEncodedPath(encodedDir: string) {
-        return path.join(encodedDir, "title_t00.mkv");
+      buildEncodedPath(encodedDir: string, sourcePath: string) {
+        return path.join(encodedDir, path.basename(sourcePath));
       },
       async encode(_inputPath: string, outputPath: string) {
         await mkdir(path.dirname(outputPath), { recursive: true });
@@ -219,6 +245,94 @@ describe("PipelineService integration", () => {
     expect(result.tmdbEpisodeCount).toBeGreaterThan(0);
     expect(result.openAiMappingCount).toBeGreaterThan(0);
     expect(await stat(result.destinationTestFile)).toBeDefined();
+  });
+
+  it("drops AI-detected stitched multi-episode titles instead of encoding them", async () => {
+    const tempDir = await createTempDir("pipeline-skip-multiepisode-");
+    tempDirs.push(tempDir);
+
+    const service = await createService(tempDir, {
+      seasonEpisodes: [
+        { seasonNumber: 1, episodeNumber: 1, name: "Pilot", runtimeMinutes: 44 },
+        { seasonNumber: 1, episodeNumber: 2, name: "Second", runtimeMinutes: 44 },
+        { seasonNumber: 1, episodeNumber: 3, name: "Third", runtimeMinutes: 40 },
+        { seasonNumber: 1, episodeNumber: 4, name: "Fourth", runtimeMinutes: 43 }
+      ],
+      rippedTitles: [
+        {
+          titleIndex: 1,
+          sourceOrder: 1,
+          fileName: "B1_t03.mkv",
+          durationSeconds: 7690,
+          reportedDurationSeconds: 7685,
+          makeMkvTitleId: 3
+        },
+        {
+          titleIndex: 2,
+          sourceOrder: 2,
+          fileName: "C1_t00.mkv",
+          durationSeconds: 2685,
+          reportedDurationSeconds: 2682,
+          makeMkvTitleId: 0
+        },
+        {
+          titleIndex: 3,
+          sourceOrder: 3,
+          fileName: "C2_t01.mkv",
+          durationSeconds: 2423,
+          reportedDurationSeconds: 2422,
+          makeMkvTitleId: 1
+        },
+        {
+          titleIndex: 4,
+          sourceOrder: 4,
+          fileName: "C3_t02.mkv",
+          durationSeconds: 2583,
+          reportedDurationSeconds: 2581,
+          makeMkvTitleId: 2
+        }
+      ],
+      matchDiscImpl: async (request) => ({
+        discLabel: request.discLabel,
+        titles: [
+          {
+            titleIndex: 1,
+            classification: "multi_episode",
+            seasonNumber: 1,
+            episodeNumbers: [1, 2, 3, 4],
+            reason: "giant stitched compilation"
+          },
+          {
+            titleIndex: 2,
+            classification: "episode",
+            seasonNumber: 1,
+            episodeNumbers: [2],
+            reason: "single"
+          },
+          {
+            titleIndex: 3,
+            classification: "episode",
+            seasonNumber: 1,
+            episodeNumbers: [3],
+            reason: "single"
+          },
+          {
+            titleIndex: 4,
+            classification: "episode",
+            seasonNumber: 1,
+            episodeNumbers: [4],
+            reason: "single"
+          }
+        ]
+      })
+    });
+
+    const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(manifest.titleJobs[0].status).toBe("skipped");
+    expect(manifest.titleJobs[0].classification).toBe("skip");
+    await expect(stat(manifest.titleJobs[0].sourcePath)).rejects.toThrow();
+    expect(manifest.titleJobs[0].finalPath).toBeUndefined();
   });
 
   it("carries over season progress so the next fresh disc starts after the last completed episode", async () => {
