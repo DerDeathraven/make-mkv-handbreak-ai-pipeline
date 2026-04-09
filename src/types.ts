@@ -1,5 +1,50 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+export type WebhookEventName =
+  | "job.disc_detected"
+  | "job.scanning"
+  | "job.ripping"
+  | "job.probing"
+  | "job.matching"
+  | "job.encoding"
+  | "job.moving"
+  | "job.completed"
+  | "job.failed"
+  | "title.moved"
+  | "title.skipped"
+  | "title.review"
+  | "title.conflict"
+  | "title.failed";
+
+export interface WebhookEndpointConfig {
+  url: string;
+}
+
+export interface WebhookConfig {
+  enabled: boolean;
+  timeoutMs: number;
+  maxRetries: number;
+  retryBackoffMs: number;
+  events: Partial<Record<WebhookEventName, WebhookEndpointConfig[]>>;
+}
+
+export interface WebhookJobPayload {
+  event: WebhookEventName;
+  timestamp: string;
+  job_id: string;
+  job_status: JobManifest["status"];
+  disc_label: string;
+  show_title: string;
+  season_number: number;
+}
+
+export interface WebhookTitlePayload extends WebhookJobPayload {
+  title_index: number;
+  title_status: TitleJobStatus;
+  classification: TitleClassification;
+  episode_numbers: number[];
+}
+
 export interface ResolvedConfig {
   app: {
     pollIntervalSeconds: number;
@@ -45,6 +90,7 @@ export interface ResolvedConfig {
   paths: {
     libraryRoot: string;
   };
+  webhooks: WebhookConfig;
 }
 
 export interface CommandResult {

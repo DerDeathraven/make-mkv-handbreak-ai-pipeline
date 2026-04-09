@@ -63,6 +63,13 @@ export function createTestConfig(rootDir: string): ResolvedConfig {
     },
     paths: {
       libraryRoot: path.join(rootDir, "library")
+    },
+    webhooks: {
+      enabled: false,
+      timeoutMs: 5000,
+      maxRetries: 2,
+      retryBackoffMs: 1000,
+      events: {}
     }
   };
 }

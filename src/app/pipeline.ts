@@ -22,6 +22,7 @@ import { buildDestinationPath } from "../naming/jellyfin";
 import { TmdbClient } from "../metadata/tmdb";
 import { FfprobeService } from "../media/ffprobe";
 import { buildDiscMatchRequest, buildEpisodeLookup, validateAndNormalizeMappings } from "../matching/mapper";
+import { WebhookDispatcher } from "../notifications/webhooks";
 import { SeriesProgressStore } from "../state/series-progress";
 import { ensureDir, fileExists, moveFile, removeFileIfExists, writeTextFile } from "../utils/fs";
 
@@ -37,6 +38,7 @@ interface PipelineDependencies {
   handbrake: HandBrakeService;
   manifestStore: JobManifestStore;
   seriesProgressStore: SeriesProgressStore;
+  webhooks: WebhookDispatcher;
 }
 
 function createJobId(discLabel: string): string {
@@ -145,11 +147,11 @@ export class PipelineService {
     await ensureDir(manifest.ripDir);
     await ensureDir(manifest.encodedDir);
     await ensureDir(manifest.reviewDir);
+    await this.setJobStatus(manifest, "disc_detected", true);
 
     try {
-      manifest.status = "scanning";
       manifest.scan = scan;
-      await this.deps.manifestStore.save(manifest);
+      await this.setJobStatus(manifest, "scanning");
 
       const seriesProgress = await this.deps.seriesProgressStore.get(
         this.deps.config.series.showTitle,
@@ -176,9 +178,8 @@ export class PipelineService {
       await this.matchTitles(manifest, seasonEpisodes, seriesProgress?.lastCompletedEpisodeNumber);
       await this.processTitleJobs(manifest);
     } catch (error) {
-      manifest.status = "failed";
       manifest.errors.push(error instanceof Error ? error.message : String(error));
-      await this.deps.manifestStore.save(manifest);
+      await this.setJobStatus(manifest, "failed");
       throw error;
     }
     return manifest;
@@ -206,6 +207,7 @@ export class PipelineService {
     destinationTestFile: string;
   }> {
     await this.validateEnvironment();
+    const smokeTestManifest = createManifest(this.deps.config, "SMOKE_TEST_DISC");
 
     const handbrakeVersion = await this.runCommandForSummary(
       this.deps.config.handbrake.binaryPath,
@@ -241,6 +243,8 @@ export class PipelineService {
       syntheticTitles,
       seasonEpisodes
     );
+    smokeTestManifest.rippedTitles = syntheticTitles;
+    await this.setJobStatus(smokeTestManifest, "matching", true);
     const openAiResponse = await this.deps.openai.matchDisc(request);
     const validatedMappings = validateAndNormalizeMappings(request, openAiResponse);
 
@@ -269,6 +273,7 @@ export class PipelineService {
     );
     await moveFile(localProbeFile, destinationTestFile);
     await verifyFileReadable(destinationTestFile);
+    await this.setJobStatus(smokeTestManifest, "completed", true);
 
     return {
       handbrakeVersion,
@@ -294,8 +299,7 @@ export class PipelineService {
     scan: DiscScan,
     seasonEpisodes: SeasonEpisode[]
   ): Promise<void> {
-    manifest.status = "ripping";
-    await this.deps.manifestStore.save(manifest);
+    await this.setJobStatus(manifest, "ripping");
 
     const selection = selectTitlesForRip(
       scan.titles,
@@ -317,8 +321,7 @@ export class PipelineService {
       selection.selectedTitles.map((title) => title.titleId)
     );
 
-    manifest.status = "probing";
-    await this.deps.manifestStore.save(manifest);
+    await this.setJobStatus(manifest, "probing");
     const rippedFiles = await this.deps.makeMkv.buildRippedTitleList(manifest.ripDir, scan);
 
     const titles: RippedTitle[] = [];
@@ -341,8 +344,7 @@ export class PipelineService {
     preloadedSeasonEpisodes: SeasonEpisode[] = [],
     lastCompletedEpisodeNumber?: number
   ): Promise<void> {
-    manifest.status = "matching";
-    await this.deps.manifestStore.save(manifest);
+    await this.setJobStatus(manifest, "matching");
 
     let seasonEpisodes: SeasonEpisode[] = [...preloadedSeasonEpisodes];
     try {
@@ -405,20 +407,18 @@ export class PipelineService {
 
   async processTitleJobs(manifest: JobManifest): Promise<void> {
     if (!manifest.titleJobs.length) {
-      manifest.status = "failed";
       manifest.errors.push("No title jobs available for processing");
-      await this.deps.manifestStore.save(manifest);
+      await this.setJobStatus(manifest, "failed");
       return;
     }
 
-    manifest.status = "encoding";
-    await this.deps.manifestStore.save(manifest);
+    await this.setJobStatus(manifest, "encoding");
 
     for (const titleJob of manifest.titleJobs) {
       const sourceTitle = manifest.rippedTitles.find((title) => title.titleIndex === titleJob.titleIndex);
       if (!sourceTitle) {
-        titleJob.status = "failed";
         titleJob.error = "Ripped source title missing";
+        await this.setTitleJobStatus(manifest, titleJob, "failed");
         continue;
       }
 
@@ -434,8 +434,7 @@ export class PipelineService {
       try {
         if (titleJob.classification === "skip") {
           await removeFileIfExists(titleJob.sourcePath);
-          titleJob.status = "skipped";
-          await this.deps.manifestStore.save(manifest);
+          await this.setTitleJobStatus(manifest, titleJob, "skipped");
           continue;
         }
 
@@ -446,8 +445,7 @@ export class PipelineService {
             sourceTitle.filePath = reviewPath;
             sourceTitle.fileName = path.basename(reviewPath);
           }
-          titleJob.status = "review";
-          await this.deps.manifestStore.save(manifest);
+          await this.setTitleJobStatus(manifest, titleJob, "review");
           continue;
         }
 
@@ -469,22 +467,18 @@ export class PipelineService {
             path.basename(encodedPath)
           );
           await moveFile(encodedPath, conflictPath);
-          titleJob.status = "conflict";
           titleJob.error = `Destination already exists: ${titleJob.finalPath}`;
-          await this.deps.manifestStore.save(manifest);
+          await this.setTitleJobStatus(manifest, titleJob, "conflict");
           continue;
         }
 
-        manifest.status = "moving";
-        await this.deps.manifestStore.save(manifest);
+        await this.setJobStatus(manifest, "moving");
         await moveFile(encodedPath, titleJob.finalPath);
         await verifyFileReadable(titleJob.finalPath);
         await removeFileIfExists(titleJob.sourcePath);
-        titleJob.status = "moved";
-        await this.deps.manifestStore.save(manifest);
-        manifest.status = "encoding";
+        await this.setTitleJobStatus(manifest, titleJob, "moved");
+        await this.setJobStatus(manifest, "encoding");
       } catch (error) {
-        titleJob.status = "failed";
         titleJob.error = error instanceof Error ? error.message : String(error);
         manifest.errors.push(`[Title ${titleJob.titleIndex}] ${titleJob.error}`);
         const reviewPath = await this.moveToReview(manifest, titleJob.sourcePath, titleJob.error);
@@ -493,11 +487,11 @@ export class PipelineService {
           sourceTitle.filePath = reviewPath;
           sourceTitle.fileName = path.basename(reviewPath);
         }
-        await this.deps.manifestStore.save(manifest);
+        await this.setTitleJobStatus(manifest, titleJob, "failed");
       }
     }
 
-    manifest.status = manifest.titleJobs.every(
+    const finalStatus = manifest.titleJobs.every(
       (titleJob) =>
         titleJob.status === "moved" ||
         titleJob.status === "skipped" ||
@@ -506,7 +500,7 @@ export class PipelineService {
     )
       ? "completed"
       : "failed";
-    await this.deps.manifestStore.save(manifest);
+    await this.setJobStatus(manifest, finalStatus);
     await this.updateSeriesProgressFromManifest(manifest);
   }
 
@@ -532,6 +526,79 @@ export class PipelineService {
       );
     }
     return (result.stdout || result.stderr).split(/\r?\n/).find((line) => line.trim()) ?? "";
+  }
+
+  private async setJobStatus(
+    manifest: JobManifest,
+    nextStatus: JobManifest["status"],
+    forceEmit = false
+  ): Promise<void> {
+    if (manifest.status !== nextStatus) {
+      manifest.status = nextStatus;
+      await this.deps.manifestStore.save(manifest);
+      await this.deps.webhooks.emitJobEvent(this.jobStatusToWebhookEvent(nextStatus), manifest);
+      return;
+    }
+
+    await this.deps.manifestStore.save(manifest);
+    if (forceEmit) {
+      await this.deps.webhooks.emitJobEvent(this.jobStatusToWebhookEvent(nextStatus), manifest);
+    }
+  }
+
+  private async setTitleJobStatus(
+    manifest: JobManifest,
+    titleJob: TitleJobRecord,
+    nextStatus: TitleJobRecord["status"]
+  ): Promise<void> {
+    titleJob.status = nextStatus;
+    await this.deps.manifestStore.save(manifest);
+    const eventName = this.titleStatusToWebhookEvent(nextStatus);
+    if (eventName) {
+      await this.deps.webhooks.emitTitleEvent(eventName, manifest, titleJob);
+    }
+  }
+
+  private jobStatusToWebhookEvent(status: JobManifest["status"]) {
+    switch (status) {
+      case "disc_detected":
+        return "job.disc_detected" as const;
+      case "scanning":
+        return "job.scanning" as const;
+      case "ripping":
+        return "job.ripping" as const;
+      case "probing":
+        return "job.probing" as const;
+      case "matching":
+        return "job.matching" as const;
+      case "encoding":
+        return "job.encoding" as const;
+      case "moving":
+        return "job.moving" as const;
+      case "completed":
+        return "job.completed" as const;
+      case "failed":
+        return "job.failed" as const;
+      case "cleanup":
+        return "job.completed" as const;
+    }
+  }
+
+  private titleStatusToWebhookEvent(status: TitleJobRecord["status"]) {
+    switch (status) {
+      case "moved":
+        return "title.moved" as const;
+      case "skipped":
+        return "title.skipped" as const;
+      case "review":
+        return "title.review" as const;
+      case "conflict":
+        return "title.conflict" as const;
+      case "failed":
+        return "title.failed" as const;
+      default:
+        return null;
+    }
   }
 
   private filterEpisodesForSequentialDiscs(
@@ -648,8 +715,7 @@ export class PipelineService {
       return;
     }
 
-    manifest.status = "matching";
-    await this.deps.manifestStore.save(manifest);
+    await this.setJobStatus(manifest, "matching");
 
     let seasonEpisodes: SeasonEpisode[] = [];
     let retryMappings: TitleMapping[];

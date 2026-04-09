@@ -11,6 +11,7 @@ import { JobManifestStore } from "../jobs/manifest";
 import { createLogger } from "../logging/logger";
 import { TmdbClient } from "../metadata/tmdb";
 import { FfprobeService } from "../media/ffprobe";
+import { WebhookDispatcher } from "../notifications/webhooks";
 import { SeriesProgressStore } from "../state/series-progress";
 import { NodeCommandRunner } from "../utils/command";
 
@@ -52,7 +53,8 @@ async function buildService(configPath: string): Promise<{
     openai: new OpenAiMatcher(config, logger),
     handbrake: new HandBrakeService(runner, config, logger),
     manifestStore: new JobManifestStore(config.app.workRoot),
-    seriesProgressStore: new SeriesProgressStore(config.app.workRoot)
+    seriesProgressStore: new SeriesProgressStore(config.app.workRoot),
+    webhooks: new WebhookDispatcher(config.webhooks, logger)
   });
   return { service, config };
 }

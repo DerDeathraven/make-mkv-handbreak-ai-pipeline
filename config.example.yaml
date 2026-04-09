@@ -41,3 +41,20 @@ ffprobe:
 
 paths:
   library_root: "/Volumes/Media/TV"
+
+webhooks:
+  enabled: false
+  timeout_ms: 5000
+  max_retries: 2
+  retry_backoff_ms: 1000
+  events:
+    job.ripping:
+      - url: "https://example.com/hooks/ripping"
+    job.completed:
+      - url: "https://example.com/hooks/completed"
+    job.failed:
+      - url: "https://example.com/hooks/failed"
+    title.review:
+      - url: "https://example.com/hooks/review"
+    title.moved:
+      - url: "https://example.com/hooks/moved"

@@ -5,6 +5,31 @@ import { z } from "zod";
 import type { ResolvedConfig } from "../types";
 
 const logLevelSchema = z.enum(["debug", "info", "warn", "error"]);
+const webhookEventNameSchema = z.enum([
+  "job.disc_detected",
+  "job.scanning",
+  "job.ripping",
+  "job.probing",
+  "job.matching",
+  "job.encoding",
+  "job.moving",
+  "job.completed",
+  "job.failed",
+  "title.moved",
+  "title.skipped",
+  "title.review",
+  "title.conflict",
+  "title.failed"
+]);
+const allowedWebhookEventNames = new Set(webhookEventNameSchema.options);
+const webhookEndpointSchema = z.object({
+  url: z
+    .string()
+    .url()
+    .refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
+      message: "Webhook URL must use http or https"
+    })
+});
 
 const configSchema = z.object({
   app: z
@@ -63,7 +88,41 @@ const configSchema = z.object({
   }),
   paths: z.object({
     library_root: z.string().min(1)
-  })
+  }),
+  webhooks: z
+    .object({
+      enabled: z.boolean().default(false),
+      timeout_ms: z.number().int().positive().default(5000),
+      max_retries: z.number().int().min(0).max(5).default(2),
+      retry_backoff_ms: z.number().int().positive().default(1000),
+      events: z.record(z.string(), z.array(webhookEndpointSchema)).default({})
+    })
+    .default({
+      enabled: false,
+      timeout_ms: 5000,
+      max_retries: 2,
+      retry_backoff_ms: 1000,
+      events: {}
+    })
+    .superRefine((value, ctx) => {
+      for (const eventName of Object.keys(value.events)) {
+        if (!allowedWebhookEventNames.has(eventName as z.infer<typeof webhookEventNameSchema>)) {
+          ctx.addIssue({
+            code: "custom",
+            message: `Unsupported webhook event: ${eventName}`,
+            path: ["events", eventName]
+          });
+        }
+      }
+
+      if (value.enabled && Object.keys(value.events).length === 0) {
+        ctx.addIssue({
+          code: "custom",
+          message: "webhooks.events must include at least one configured event when webhooks are enabled",
+          path: ["events"]
+        });
+      }
+    })
 });
 
 function resolveSecret(value: string | undefined, envName: string): string {
@@ -133,6 +192,13 @@ export async function loadConfig(configPath: string): Promise<ResolvedConfig> {
     },
     paths: {
       libraryRoot: resolvePath(parsed.paths.library_root)
+    },
+    webhooks: {
+      enabled: parsed.webhooks.enabled,
+      timeoutMs: parsed.webhooks.timeout_ms,
+      maxRetries: parsed.webhooks.max_retries,
+      retryBackoffMs: parsed.webhooks.retry_backoff_ms,
+      events: parsed.webhooks.events
     }
   };
 }

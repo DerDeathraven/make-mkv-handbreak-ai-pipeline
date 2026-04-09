@@ -1,23 +1,28 @@
 import path from "node:path";
 import { chmod, writeFile, mkdir, stat } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
-import type { DiscMatchRequest, DiscMatchResponse, SeasonEpisode } from "../src/types";
+import type { DiscMatchRequest, DiscMatchResponse, SeasonEpisode, WebhookConfig } from "../src/types";
 import { PipelineService } from "../src/app/pipeline";
 import { JobManifestStore } from "../src/jobs/manifest";
+import { WebhookDispatcher } from "../src/notifications/webhooks";
 import { SeriesProgressStore } from "../src/state/series-progress";
 import { createTempDir, createTestConfig, noopLogger, removeTempDir } from "./helpers";
 
 describe("PipelineService integration", () => {
   const tempDirs: string[] = [];
+  const originalFetch = globalThis.fetch;
 
   afterEach(async () => {
+    globalThis.fetch = originalFetch;
     await Promise.all(tempDirs.splice(0).map(removeTempDir));
   });
 
   async function createService(rootDir: string, options?: {
     openAiError?: string;
+    handbrakeError?: string;
     conflict?: boolean;
     seasonEpisodes?: SeasonEpisode[];
+    webhookEvents?: WebhookConfig["events"];
     matchDiscImpl?: (request: DiscMatchRequest) => Promise<DiscMatchResponse>;
     rippedTitles?: Array<{
       titleIndex: number;
@@ -30,6 +35,13 @@ describe("PipelineService integration", () => {
     }>;
   }): Promise<PipelineService> {
     const config = createTestConfig(rootDir);
+    if (options?.webhookEvents) {
+      config.webhooks = {
+        ...config.webhooks,
+        enabled: true,
+        events: options.webhookEvents
+      };
+    }
     const binaryPaths = [
       config.makemkv.binaryPath,
       config.handbrake.binaryPath,
@@ -127,6 +139,9 @@ describe("PipelineService integration", () => {
         return path.join(encodedDir, path.basename(sourcePath));
       },
       async encode(_inputPath: string, outputPath: string) {
+        if (options?.handbrakeError) {
+          throw new Error(options.handbrakeError);
+        }
         await mkdir(path.dirname(outputPath), { recursive: true });
         await writeFile(outputPath, "encoded");
         return `${outputPath}.handbrake.log`;
@@ -164,7 +179,8 @@ describe("PipelineService integration", () => {
       openai: openai as never,
       handbrake: handbrake as never,
       manifestStore,
-      seriesProgressStore: new SeriesProgressStore(config.app.workRoot)
+      seriesProgressStore: new SeriesProgressStore(config.app.workRoot),
+      webhooks: new WebhookDispatcher(config.webhooks, noopLogger)
     });
   }
 
@@ -245,6 +261,238 @@ describe("PipelineService integration", () => {
     expect(result.tmdbEpisodeCount).toBeGreaterThan(0);
     expect(result.openAiMappingCount).toBeGreaterThan(0);
     expect(await stat(result.destinationTestFile)).toBeDefined();
+  });
+
+  it("emits matching and completed webhooks during smoke-test when configured", async () => {
+    const tempDir = await createTempDir("pipeline-smoke-test-webhooks-");
+    tempDirs.push(tempDir);
+    const events: string[] = [];
+    globalThis.fetch = async (_input, init) => {
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { event: string };
+      events.push(payload.event);
+      return new Response("ok", { status: 200 });
+    };
+
+    const service = await createService(tempDir, {
+      webhookEvents: {
+        "job.matching": [{ url: "https://example.test/job-matching" }],
+        "job.completed": [{ url: "https://example.test/job-completed" }]
+      }
+    });
+
+    await service.runSmokeTest();
+
+    expect(events).toEqual(["job.matching", "job.completed"]);
+  });
+
+  it("emits configured job and title webhooks for a successful run", async () => {
+    const tempDir = await createTempDir("pipeline-webhook-success-");
+    tempDirs.push(tempDir);
+    const deliveries: Array<{ url: string; payload: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      deliveries.push({
+        url: String(input),
+        payload: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+      });
+      return new Response("ok", { status: 200 });
+    };
+
+    const service = await createService(tempDir, {
+      webhookEvents: {
+        "job.ripping": [{ url: "https://example.test/job-ripping" }],
+        "job.completed": [{ url: "https://example.test/job-completed" }],
+        "title.moved": [{ url: "https://example.test/title-moved" }]
+      }
+    });
+
+    const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(manifest.status).toBe("completed");
+    expect(deliveries).toHaveLength(3);
+    expect(deliveries.map((delivery) => delivery.payload.event)).toEqual([
+      "job.ripping",
+      "title.moved",
+      "job.completed"
+    ]);
+    expect(deliveries[0]?.payload).toMatchObject({
+      job_id: manifest.jobId,
+      disc_label: manifest.discLabel,
+      show_title: manifest.showTitle,
+      season_number: manifest.seasonNumber
+    });
+    expect(deliveries[1]?.payload).toMatchObject({
+      title_index: 1,
+      title_status: "moved",
+      classification: "episode",
+      episode_numbers: [1]
+    });
+    expect(deliveries[1]?.payload).not.toHaveProperty("finalPath");
+    expect(deliveries[1]?.payload).not.toHaveProperty("sourcePath");
+  });
+
+  it("emits title.review when matching falls back to review", async () => {
+    const tempDir = await createTempDir("pipeline-webhook-review-");
+    tempDirs.push(tempDir);
+    const events: string[] = [];
+    globalThis.fetch = async (_input, init) => {
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { event: string };
+      events.push(payload.event);
+      return new Response("ok", { status: 200 });
+    };
+
+    const service = await createService(tempDir, {
+      openAiError: "timeout",
+      webhookEvents: {
+        "title.review": [{ url: "https://example.test/title-review" }]
+      }
+    });
+
+    const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(manifest.titleJobs[0].status).toBe("review");
+    expect(events).toEqual(["title.review"]);
+  });
+
+  it("emits title.skipped when a stitched compilation is dropped", async () => {
+    const tempDir = await createTempDir("pipeline-webhook-skipped-");
+    tempDirs.push(tempDir);
+    const events: string[] = [];
+    globalThis.fetch = async (_input, init) => {
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { event: string };
+      events.push(payload.event);
+      return new Response("ok", { status: 200 });
+    };
+
+    const service = await createService(tempDir, {
+      webhookEvents: {
+        "title.skipped": [{ url: "https://example.test/title-skipped" }]
+      },
+      seasonEpisodes: [
+        { seasonNumber: 1, episodeNumber: 1, name: "Pilot", runtimeMinutes: 44 },
+        { seasonNumber: 1, episodeNumber: 2, name: "Second", runtimeMinutes: 44 },
+        { seasonNumber: 1, episodeNumber: 3, name: "Third", runtimeMinutes: 40 },
+        { seasonNumber: 1, episodeNumber: 4, name: "Fourth", runtimeMinutes: 43 }
+      ],
+      rippedTitles: [
+        {
+          titleIndex: 1,
+          sourceOrder: 1,
+          fileName: "B1_t03.mkv",
+          durationSeconds: 7690,
+          reportedDurationSeconds: 7685,
+          makeMkvTitleId: 3
+        },
+        {
+          titleIndex: 2,
+          sourceOrder: 2,
+          fileName: "C1_t00.mkv",
+          durationSeconds: 2685,
+          reportedDurationSeconds: 2682,
+          makeMkvTitleId: 0
+        },
+        {
+          titleIndex: 3,
+          sourceOrder: 3,
+          fileName: "C2_t01.mkv",
+          durationSeconds: 2423,
+          reportedDurationSeconds: 2422,
+          makeMkvTitleId: 1
+        },
+        {
+          titleIndex: 4,
+          sourceOrder: 4,
+          fileName: "C3_t02.mkv",
+          durationSeconds: 2583,
+          reportedDurationSeconds: 2581,
+          makeMkvTitleId: 2
+        }
+      ],
+      matchDiscImpl: async (request) => ({
+        discLabel: request.discLabel,
+        titles: [
+          {
+            titleIndex: 1,
+            classification: "multi_episode",
+            seasonNumber: 1,
+            episodeNumbers: [1, 2, 3, 4],
+            reason: "giant stitched compilation"
+          },
+          {
+            titleIndex: 2,
+            classification: "episode",
+            seasonNumber: 1,
+            episodeNumbers: [2],
+            reason: "single"
+          },
+          {
+            titleIndex: 3,
+            classification: "episode",
+            seasonNumber: 1,
+            episodeNumbers: [3],
+            reason: "single"
+          },
+          {
+            titleIndex: 4,
+            classification: "episode",
+            seasonNumber: 1,
+            episodeNumbers: [4],
+            reason: "single"
+          }
+        ]
+      })
+    });
+
+    const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(manifest.titleJobs[0].status).toBe("skipped");
+    expect(events).toContain("title.skipped");
+  });
+
+  it("emits title.failed and keeps running when webhook delivery itself fails", async () => {
+    const tempDir = await createTempDir("pipeline-webhook-failed-");
+    tempDirs.push(tempDir);
+    let attempts = 0;
+    globalThis.fetch = async () => {
+      attempts += 1;
+      throw new Error("webhook down");
+    };
+
+    const service = await createService(tempDir, {
+      handbrakeError: "encode failed",
+      webhookEvents: {
+        "title.failed": [{ url: "https://example.test/title-failed" }]
+      }
+    });
+
+    const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(manifest.titleJobs[0].status).toBe("failed");
+    expect(manifest.status).toBe("failed");
+    expect(attempts).toBe(3);
+    expect(await stat(path.join(manifest.reviewDir, "title_t00.mkv"))).toBeDefined();
+  });
+
+  it("does not change a successful run outcome when webhook delivery fails", async () => {
+    const tempDir = await createTempDir("pipeline-webhook-best-effort-");
+    tempDirs.push(tempDir);
+    let attempts = 0;
+    globalThis.fetch = async () => {
+      attempts += 1;
+      throw new Error("webhook down");
+    };
+
+    const service = await createService(tempDir, {
+      webhookEvents: {
+        "title.moved": [{ url: "https://example.test/title-moved" }]
+      }
+    });
+
+    const manifest = await service.processDetectedDisc({ present: true, rawOutput: "" });
+
+    expect(manifest.titleJobs[0].status).toBe("moved");
+    expect(manifest.status).toBe("completed");
+    expect(attempts).toBe(3);
+    expect(await stat(manifest.titleJobs[0].finalPath!)).toBeDefined();
   });
 
   it("drops AI-detected stitched multi-episode titles instead of encoding them", async () => {

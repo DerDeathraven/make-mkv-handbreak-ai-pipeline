@@ -43,6 +43,8 @@ describe("buildPrompt", () => {
     });
 
     expect(prompt).toContain("Watch for stitched-together files");
+    expect(prompt).toContain("at most 2 consecutive episodes");
+    expect(prompt).toContain("3 or more consecutive episodes");
     expect(prompt).toContain('"following_title_durations_seconds": [\n      2685,\n      2423\n    ]');
     expect(prompt).toContain('"next_title_duration_seconds": 2685');
   });

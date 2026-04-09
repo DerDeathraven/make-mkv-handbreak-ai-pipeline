@@ -47,6 +47,7 @@ Copy [config.example.yaml](/Users/jlcd/Documents/projects/Piracy-Automation-pipe
 - `handbrake.binary_path`
 - `ffprobe.binary_path`
 - `matching.stitched_title_multiplier`
+- `webhooks`
 
 API keys can be written inline or referenced as `env:VARIABLE_NAME`.
 
@@ -75,6 +76,25 @@ Homebrew-installed binaries on this machine are:
 - `makemkvcon`: `/opt/homebrew/bin/makemkvcon`
 - `HandBrakeCLI`: `/opt/homebrew/bin/HandBrakeCLI`
 - `ffprobe`: `/opt/homebrew/bin/ffprobe`
+
+Webhook example:
+
+```yaml
+webhooks:
+  enabled: true
+  timeout_ms: 5000
+  max_retries: 2
+  retry_backoff_ms: 1000
+  events:
+    job.ripping:
+      - url: "https://example.com/hooks/ripping"
+    job.completed:
+      - url: "https://example.com/hooks/completed"
+    title.review:
+      - url: "https://example.com/hooks/review"
+    title.moved:
+      - url: "https://example.com/hooks/moved"
+```
 
 ## External Services
 
@@ -116,6 +136,66 @@ That metadata is used for two things:
 - helping the rip stage skip obviously giant stitched-together compilation titles before ripping them
 
 TMDb does not do the final guessing itself. It provides the candidate season data that the rest of the pipeline works from.
+
+## Webhooks
+
+Webhooks are optional and disabled by default. If enabled, the pipeline sends JSON `POST` requests for configured events only.
+
+Supported event keys:
+
+- `job.disc_detected`
+- `job.scanning`
+- `job.ripping`
+- `job.probing`
+- `job.matching`
+- `job.encoding`
+- `job.moving`
+- `job.completed`
+- `job.failed`
+- `title.moved`
+- `title.skipped`
+- `title.review`
+- `title.conflict`
+- `title.failed`
+
+Example job payload:
+
+```json
+{
+  "event": "job.ripping",
+  "timestamp": "2026-04-09T10:00:00.000Z",
+  "job_id": "2026-04-09T10-00-00-000Z-disc",
+  "job_status": "ripping",
+  "disc_label": "DISC_2",
+  "show_title": "The Librarians",
+  "season_number": 1
+}
+```
+
+Example title payload:
+
+```json
+{
+  "event": "title.moved",
+  "timestamp": "2026-04-09T10:30:00.000Z",
+  "job_id": "2026-04-09T10-00-00-000Z-disc",
+  "job_status": "moving",
+  "disc_label": "DISC_2",
+  "show_title": "The Librarians",
+  "season_number": 1,
+  "title_index": 2,
+  "title_status": "moved",
+  "classification": "episode",
+  "episode_numbers": [5]
+}
+```
+
+Webhook notes:
+
+- delivery is best-effort and never blocks or fails the media pipeline
+- delivery is at-least-once, so receivers should treat `job_id + event + title_index` as an idempotency key
+- only minimal metadata is sent; file paths, manifest snapshots, and raw rip output are intentionally omitted
+- v1 does not support auth headers, signing, or custom headers
 
 ## Notes
 
